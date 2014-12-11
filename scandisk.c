@@ -16,10 +16,120 @@
 #include "fat.h"
 #include "dos.h"
 
+
 #define TOTAL_CLUSTERS(bpb) (bpb->bpbSectors / bpb->bpbSecPerClust)
 #define CLUSTER_SIZE(bpb) (bpb->bpbSecPerClust * bpb->bpbBytesPerSec)
 
-void follow_file(uint16_t cluster, uint32_t size, uint8_t *img_buf, struct bpb33 *bpb, char *ref_clusters, char *path){
+/* helper functions related to managing orphans */
+typedef struct {
+    uint16_t *cluster_p;
+    int list_size;  //actual size of the array
+    int orphan_size; //how many cluster currently in this orphan
+} orphan;
+
+void orphan_init(orphan *orp){
+    orp->list_size = 5; //default size 5
+    orp->orphan_size = 0;
+    orp->cluster_p = (uint16_t *) malloc(sizeof(uint16_t) * orp->list_size);
+}
+
+void orphan_add(orphan *orp, uint16_t first, uint16_t second){
+    if (orp->orphan_size == orp->list_size){ //need to resize
+        orp->list_size = orp->list_size * 2;
+        orp->cluster_p = (uint16_t *) realloc(orp->cluster_p, sizeof(uint16_t) * orp->list_size);
+    }
+
+    //add here
+    if (orp->orphan_size == 0){ // orphan list is empty initially
+        orp->cluster_p[0] = first;
+        orp->cluster_p[1] = second;
+        orp->orphan_size = 2;
+    } else if (first == orp->cluster_p[orp->orphan_size - 1]){ //new orphan tail
+        orp->cluster_p[orp->orphan_size] = second;
+        orp->orphan_size++;
+    } else if (second == orp->cluster_p[0]){   //new orphan head
+        uint16_t *chain = orp->cluster_p;
+        orp->cluster_p = (uint16_t *) malloc(sizeof(uint16_t) * orp->list_size);
+        orp->cluster_p[0] = first;
+        memcpy(&(orp->cluster_p[1]), chain, sizeof(uint16_t) * (orp->orphan_size));
+        orp->orphan_size++;
+        free(chain); 
+    } else { //should not happen
+        fprintf(stderr, "orphan_add is wrong!\n");
+    }
+}
+
+void orphan_print(orphan *orp){
+    printf("printing one orphan:\n");
+    for (int i = 0; i < orp->orphan_size; i++){
+        printf("%d ", orp->cluster_p[i]);
+    }
+    printf("\nend of one orphan\n");
+}
+
+void orphan_destroy(orphan *orp){
+    free(orp->cluster_p);
+    free(orp);
+}
+
+
+/* -------------------------------------------- */
+
+void follow_orphan(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb){
+    orphan *orp = (orphan *) malloc(sizeof(orphan));
+    orphan_init(orp);
+
+    uint16_t next_cluster;
+
+    while (is_valid_cluster(cluster, bpb)){
+        printf("%d ", cluster);
+        next_cluster = get_fat_entry(cluster, img_buf, bpb);
+        orphan_add(orp, cluster, next_cluster);
+        cluster = next_cluster;
+    }
+    orphan_print(orp);
+    orphan_destroy(orp);
+}
+
+
+int is_chained(uint16_t cluster, struct bpb33 *bpb){
+    // if (!is_valid_cluster(cluster, bpb)){
+    //     //printf("%d\n", cluster);
+    //     return 0;}
+    if (cluster >= (CLUST_RSRVDS & FAT12_MASK) && cluster <= (CLUST_RSRVDE & FAT12_MASK))
+        return 0;
+    else if (cluster == (CLUST_BAD & FAT12_MASK))
+        return 0;
+    // else if (cluster < (CLUST_FIRST & FAT12_MASK))
+    //     return false;
+    else if (cluster == (CLUST_FREE & FAT12_MASK))
+        return 0;
+    else
+        return 1;
+}
+
+void traverse_ref(char *ref, uint8_t *img_buf, struct bpb33 *bpb){
+    uint16_t fat_value;
+    for(int i = 2; i < TOTAL_CLUSTERS(bpb); i++){
+        if (ref[i] == 0){
+            fat_value = get_fat_entry(i, img_buf, bpb);
+            //printf("fat is %d \n", fat_value);
+            if (is_chained(fat_value, bpb)){
+                follow_orphan(i, img_buf, bpb);
+            }
+        }
+    }
+}
+
+/* Mark the given cluster as referenced
+ * 0 - unreferenced
+ * 1 - referenced
+ * ref should have been initialized to all 0's */
+void update_ref(uint16_t cluster, char *ref){
+    ref[cluster] = 1;
+}
+
+void follow_file(uint16_t cluster, uint32_t size, uint8_t *img_buf, struct bpb33 *bpb, char *ref, char *path){
     uint32_t size_from_dirent = size;
     uint16_t last_fat_entry = 0;
     uint32_t chain_size = 0;
@@ -28,6 +138,7 @@ void follow_file(uint16_t cluster, uint32_t size, uint8_t *img_buf, struct bpb33
     //assert(cluster != 0);
     while (is_valid_cluster(cluster, bpb)){
         /* !!! mark this cluster referenced here !!! */
+        update_ref(cluster, ref);
 
         chain_size += CLUSTER_SIZE(bpb);
 
@@ -56,7 +167,7 @@ void follow_file(uint16_t cluster, uint32_t size, uint8_t *img_buf, struct bpb33
 
 /* parse a given dirent, returns the starting cluster if the given
 dirent indicates a directory and 0 otherwise */
-uint16_t parse_dirent(struct direntry *dirent, uint8_t *img_buf, struct bpb33 *bpb, char *ref_clusters, char *path){
+uint16_t parse_dirent(struct direntry *dirent, uint8_t *img_buf, struct bpb33 *bpb, char *ref, char *path){
     uint16_t subdir_cluster = 0;  //initialize to an invalid cluster
 
     char name[9];
@@ -117,27 +228,29 @@ uint16_t parse_dirent(struct direntry *dirent, uint8_t *img_buf, struct bpb33 *b
 
         uint32_t size_from_dirent = getulong(dirent->deFileSize);
         uint16_t starting_cluster = getushort(dirent->deStartCluster);
-        follow_file(starting_cluster, size_from_dirent, img_buf, bpb, ref_clusters, path);
+        follow_file(starting_cluster, size_from_dirent, img_buf, bpb, ref, path);
     }
 
     return subdir_cluster;
 }
 
-void follow_dir(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb, char *ref_clusters, char *path){
+void follow_dir(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb, char *ref, char *path){
     char pathcopy[MAXPATHLEN];
     
 
     while (is_valid_cluster(cluster, bpb)){
         /* !!! mark this cluster referenced here !!! */
+        update_ref(cluster, ref);
+
         struct direntry *dirent = (struct direntry *) cluster_to_addr(cluster, img_buf, bpb);
 
         int numDirEntries = (bpb->bpbBytesPerSec * bpb->bpbSecPerClust) / sizeof(struct direntry);
         for (int i = 0; i < numDirEntries; i++){    //parse every direntry and follow subdir if any
             strcpy(pathcopy, path); //intilizes pathcopy to this dir's path for every entry
 
-            uint16_t subdir_cluster = parse_dirent(dirent, img_buf, bpb, ref_clusters, pathcopy);
+            uint16_t subdir_cluster = parse_dirent(dirent, img_buf, bpb, ref, pathcopy);
             if (subdir_cluster){
-                follow_dir(subdir_cluster, img_buf, bpb, ref_clusters, pathcopy);
+                follow_dir(subdir_cluster, img_buf, bpb, ref, pathcopy);
             }
             dirent++;
         }
@@ -151,48 +264,63 @@ char *traverse_root(uint8_t *img_buf, struct bpb33 *bpb){
 
     char path[MAXPATHLEN];
 
-    //ref_clusters keeps track of clusters referenced by some dirent metadata
-    char *ref_clusters = (char *) malloc(sizeof(char) * TOTAL_CLUSTERS(bpb));
-    memset(ref_clusters, 0, sizeof(char) * TOTAL_CLUSTERS(bpb));
+    //ref keeps track of clusters referenced by some dirent metadata
+    char *ref = (char *) malloc(sizeof(char) * TOTAL_CLUSTERS(bpb));
+    memset(ref, 0, TOTAL_CLUSTERS(bpb));
 
     for (int i = 0; i < bpb->bpbRootDirEnts ;i++){   //go through every entry in root dir
         strcpy(path, "/"); //reinitialize path back to "/" for the next root dir entry
 
-        uint16_t subdir_cluster = parse_dirent(dirent, img_buf, bpb, ref_clusters, path);
+        uint16_t subdir_cluster = parse_dirent(dirent, img_buf, bpb, ref, path);
         if (is_valid_cluster(subdir_cluster, bpb)){
-            follow_dir(subdir_cluster, img_buf, bpb, ref_clusters, path);
+            follow_dir(subdir_cluster, img_buf, bpb, ref, path);
         }
         dirent++;   //still in root dir, just increment to get next dir entry
     }
-    return ref_clusters;
+    return ref;
 }
-
 
 void usage(char *progname) {
     fprintf(stderr, "usage: %s <imagename>\n", progname);
     exit(1);
 }
 
+/* debugging helpers */
+void print_ref(char *ref){
+    for (int i = 0; i < 2880; i++){
+        // if (ref[i] == 0)
+        //     printf("%c ", 'x');
+        // else if (i == 2879)
+        //     printf("2879\n");
+        // else
+        //     printf("%c ", 'p');
+        if (i == 2879)
+            printf("2879\n");
+    }
+}
+
+/* --------------------- */
 
 int main(int argc, char** argv) {
     uint8_t *img_buf;
     int fd;
     struct bpb33* bpb;
 
-    char *ref_clusters;
+    char *ref; //keeps track of clusters referenced by some dir entry metadata
 
-    if (argc < 2) {
-       usage(argv[0]);
-    }
 
     img_buf = mmap_file(argv[1], &fd);
     bpb = check_bootsector(img_buf);
     
     // your code should start here...
-    ref_clusters = traverse_root(img_buf, bpb);
+    ref = traverse_root(img_buf, bpb);
+
+    printf("checking for orphans...\n");
+    traverse_ref(ref, img_buf, bpb);
+    printf("Finished checking for orphans...\n");
 
     unmmap_file(img_buf, &fd);
     free(bpb);
-    free(ref_clusters);
+    free(ref);
     return 0;
 }

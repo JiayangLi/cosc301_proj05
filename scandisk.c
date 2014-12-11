@@ -72,17 +72,27 @@ void orphan_destroy(orphan *orp){
     free(orp);
 }
 
-
 /* -------------------------------------------- */
 
-void follow_orphan(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb){
+/* Mark the given cluster as referenced
+ * 0 - unreferenced
+ * 1 - referenced
+ * ref should have been initialized to all 0's */
+void update_ref(uint16_t cluster, char *ref){
+    ref[cluster] = 1;
+}
+
+void follow_orphan(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb, char *ref){
     orphan *orp = (orphan *) malloc(sizeof(orphan));
     orphan_init(orp);
 
     uint16_t next_cluster;
 
     while (is_valid_cluster(cluster, bpb)){
-        printf("%d ", cluster);
+        //need to mark this entire orphan chain as "referenced"
+        //to ensure each orphan is visited once
+        update_ref(cluster, ref);  
+
         next_cluster = get_fat_entry(cluster, img_buf, bpb);
         orphan_add(orp, cluster, next_cluster);
         cluster = next_cluster;
@@ -115,18 +125,10 @@ void traverse_ref(char *ref, uint8_t *img_buf, struct bpb33 *bpb){
             fat_value = get_fat_entry(i, img_buf, bpb);
             //printf("fat is %d \n", fat_value);
             if (is_chained(fat_value, bpb)){
-                follow_orphan(i, img_buf, bpb);
+                follow_orphan(i, img_buf, bpb, ref);
             }
         }
     }
-}
-
-/* Mark the given cluster as referenced
- * 0 - unreferenced
- * 1 - referenced
- * ref should have been initialized to all 0's */
-void update_ref(uint16_t cluster, char *ref){
-    ref[cluster] = 1;
 }
 
 void follow_file(uint16_t cluster, uint32_t size, uint8_t *img_buf, struct bpb33 *bpb, char *ref, char *path){

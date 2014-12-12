@@ -131,6 +131,23 @@ void traverse_ref(char *ref, uint8_t *img_buf, struct bpb33 *bpb){
     }
 }
 
+/* Mark a given cluster as EOF in FAT */
+void mark_EOF(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb){
+    //printf("setting cluster %d to EOF", cluster);
+    set_fat_entry(cluster, FAT12_MASK&CLUST_EOFS, img_buf, bpb);
+}
+
+/* Free all clusters starting from the given cluster*/
+void free_clusters(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb){
+    uint16_t next_cluster;
+
+    while (is_valid_cluster(cluster, bpb)){
+        next_cluster = get_fat_entry(cluster, img_buf, bpb);
+        set_fat_entry(cluster, FAT12_MASK&CLUST_FREE, img_buf, bpb);
+        cluster = next_cluster;
+    }
+}
+
 void follow_file(uint16_t cluster, uint32_t size, uint8_t *img_buf, struct bpb33 *bpb, char *ref, char *path){
     uint32_t size_from_dirent = size;
     uint16_t last_fat_entry = 0;
@@ -157,8 +174,12 @@ void follow_file(uint16_t cluster, uint32_t size, uint8_t *img_buf, struct bpb33
     // printf("cluster number: %d\n", cluster);
     //printf("chain size: %d\n", chain_size);
     if (is_valid_cluster(cluster, bpb)){    //still in the middle of a chain, free following clusters
-        /* !!! free clusters beginning from cluster !!! */
         printf("%s: chain size (%d) greater than dirent size (%d)\n", path, chain_size, size_from_dirent);
+         
+        /* !!! fix chain > dirent size issue !!! */
+        mark_EOF(last_fat_entry, img_buf, bpb);
+        free_clusters(cluster, img_buf, bpb);
+
     } else if (size_from_dirent > chain_size){  //reached the end of chain, but dirent size is still too big
         /* !!! adjust dirent size !!! */
         printf("%s: chain size (%d) less than dirent size (%d)\n", path, chain_size, size_from_dirent);
@@ -320,6 +341,12 @@ int main(int argc, char** argv) {
     printf("checking for orphans...\n");
     traverse_ref(ref, img_buf, bpb);
     printf("Finished checking for orphans...\n");
+
+    // set_fat_entry(500, 600, img_buf, bpb);
+    // set_fat_entry(600, FAT12_MASK&CLUST_EOFS, img_buf, bpb);
+
+    // printf("cluster 500: %d\n", get_fat_entry(500, img_buf, bpb));
+    // printf("cluster 600: %d\n", get_fat_entry(600, img_buf, bpb));
 
     unmmap_file(img_buf, &fd);
     free(bpb);

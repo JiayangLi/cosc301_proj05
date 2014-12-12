@@ -131,12 +131,6 @@ void traverse_ref(char *ref, uint8_t *img_buf, struct bpb33 *bpb){
     }
 }
 
-/* Mark a given cluster as EOF in FAT */
-void mark_EOF(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb){
-    //printf("setting cluster %d to EOF", cluster);
-    set_fat_entry(cluster, FAT12_MASK&CLUST_EOFS, img_buf, bpb);
-}
-
 /* Free all clusters starting from the given cluster*/
 void free_clusters(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb){
     uint16_t next_cluster;
@@ -148,7 +142,8 @@ void free_clusters(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb){
     }
 }
 
-void follow_file(uint16_t cluster, uint32_t size, uint8_t *img_buf, struct bpb33 *bpb, char *ref, char *path){
+/* Returns the chain size if needed to update dirent size, 0 otherwise */
+uint32_t follow_file(uint16_t cluster, uint32_t size, uint8_t *img_buf, struct bpb33 *bpb, char *ref, char *path){
     uint32_t size_from_dirent = size;
     uint16_t last_fat_entry = 0;
     uint32_t chain_size = 0;
@@ -174,18 +169,21 @@ void follow_file(uint16_t cluster, uint32_t size, uint8_t *img_buf, struct bpb33
     // printf("cluster number: %d\n", cluster);
     //printf("chain size: %d\n", chain_size);
     if (is_valid_cluster(cluster, bpb)){    //still in the middle of a chain, free following clusters
-        printf("%s: chain size (%d) greater than dirent size (%d)\n", path, chain_size, size_from_dirent);
+        printf("%s: chain size (>%d) greater than dirent size (%d)\n", path, chain_size, size_from_dirent);
          
-        /* !!! fix chain > dirent size issue !!! */
-        mark_EOF(last_fat_entry, img_buf, bpb);
+        /* !!! fix chain > dirent size issue - truncate and free clusters !!! */
+        printf("Truncating the file and releasing extra clusters...\n");
+        set_fat_entry(last_fat_entry, FAT12_MASK&CLUST_EOFS, img_buf, bpb);
         free_clusters(cluster, img_buf, bpb);
 
     } else if (size_from_dirent > chain_size){  //reached the end of chain, but dirent size is still too big
-        /* !!! adjust dirent size !!! */
         printf("%s: chain size (%d) less than dirent size (%d)\n", path, chain_size, size_from_dirent);
+        return chain_size;
     } else {
         printf("%s: normal file!\n", path);
     }
+
+    return 0;
 }
 
 /* parse a given dirent, returns the starting cluster if the given
@@ -251,7 +249,13 @@ uint16_t parse_dirent(struct direntry *dirent, uint8_t *img_buf, struct bpb33 *b
 
         uint32_t size_from_dirent = getulong(dirent->deFileSize);
         uint16_t starting_cluster = getushort(dirent->deStartCluster);
-        follow_file(starting_cluster, size_from_dirent, img_buf, bpb, ref, path);
+        uint32_t chain_size = follow_file(starting_cluster, size_from_dirent, img_buf, bpb, ref, path);
+
+        if (chain_size){
+            /* !!! fix dirent size > chain issue - adjust dirent size !!! */
+            printf("Changing directory entry size metadata to %d...\n", chain_size);
+            putulong(dirent->deFileSize, chain_size);
+        }
     }
 
     return subdir_cluster;

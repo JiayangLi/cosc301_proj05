@@ -65,6 +65,13 @@ int orphan_add(orphan *orp, uint16_t first, uint16_t second){
     return 1;
 }
 
+void fix_orphan_EOF(orphan *orp){
+    uint16_t last = orp->cluster_p[orp->orphan_size - 1];
+    if (!is_end_of_file(last)){
+        orphan_add(orp, last, FAT12_MASK & CLUST_EOFS);
+    }
+}
+
 void orphan_print(orphan *orp){
     printf("printing an orphan chain: ");
     for (int i = 0; i < orp->orphan_size; i++){
@@ -77,11 +84,6 @@ void orphan_destroy(orphan *orp){
     free(orp->cluster_p);
     free(orp);
 }
-
-// void orphans_list_init(orphans_node *list){
-//     list->next = NULL;
-//     list->one_orphan = NULL;
-// }
 
 void orphans_list_add(orphans_node **list, uint16_t first, uint16_t second){
     if (*list == NULL){ //first orphan encountered
@@ -180,43 +182,19 @@ void get_orphan_home(orphan *orp, uint8_t *img_buf, struct bpb33 *bpb, int orpha
  * 0 - unreferenced
  * 1 - referenced
  * ref should have been initialized to all 0's */
-void update_ref(uint16_t cluster, char *ref){
+int update_ref(uint16_t cluster, char *ref){
+    if (ref[cluster]){
+        return 1;
+    }
     ref[cluster] = 1;
+    return 0;
 }
 
-// void follow_orphan(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb, char *ref, int orphan_id){
-//     orphan *orp = (orphan *) malloc(sizeof(orphan));
-//     orphan_init(orp);
-
-//     uint16_t next_cluster;
-
-//     while (is_valid_cluster(cluster, bpb)){
-//         //need to mark this entire orphan chain as "referenced"
-//         //to ensure each orphan is visited once
-//         update_ref(cluster, ref);  
-
-//         next_cluster = get_fat_entry(cluster, img_buf, bpb);
-//         orphan_add(orp, cluster, next_cluster);
-//         cluster = next_cluster;
-//     }
-//     orphan_print(orp);
-//     /* Get the orphan home!!! - create a dirent for it in root dir*/
-//     get_orphan_home(orp, img_buf, bpb, orphan_id);
-
-//     orphan_destroy(orp);
-// }
-
-
-int is_chained(uint16_t cluster, struct bpb33 *bpb){
-    // if (!is_valid_cluster(cluster, bpb)){
-    //     //printf("%d\n", cluster);
-    //     return 0;}
+int is_chained(uint16_t cluster){
     if (cluster >= (CLUST_RSRVDS & FAT12_MASK) && cluster <= (CLUST_RSRVDE & FAT12_MASK))
         return 0;
     else if (cluster == (CLUST_BAD & FAT12_MASK))
         return 0;
-    // else if (cluster < (CLUST_FIRST & FAT12_MASK))
-    //     return false;
     else if (cluster == (CLUST_FREE & FAT12_MASK))
         return 0;
     else
@@ -231,17 +209,19 @@ void traverse_ref(char *ref, uint8_t *img_buf, struct bpb33 *bpb){
     for(int i = 2; i < TOTAL_CLUSTERS(bpb); i++){
         if (ref[i] == 0){
             fat_value = get_fat_entry(i, img_buf, bpb);
-            if (is_chained(fat_value, bpb)){
-                // printf("%d\n", i);
-                //follow_orphan(i, img_buf, bpb, ref, orphan_id);
-                // orphan_id++;
-                orphans_list_add(&orphans_list, i, fat_value);
+            if (is_chained(fat_value)){
+                if (fat_value == (CLUST_BAD & FAT12_MASK) || fat_value == (CLUST_FREE & FAT12_MASK) || ref[fat_value]){
+                    orphans_list_add(&orphans_list, i, (CLUST_EOFS & FAT12_MASK));
+                } else {
+                    orphans_list_add(&orphans_list, i, fat_value);
+                }             
             }
         }
     }
     orphans_node *to_free = orphans_list;
 
     for (; orphans_list != NULL; orphans_list = orphans_list->next){
+        fix_orphan_EOF(orphans_list->one_orphan);
         orphan_print(orphans_list->one_orphan);
         get_orphan_home(orphans_list->one_orphan, img_buf, bpb, orphan_id);
         orphan_id++;
@@ -267,31 +247,46 @@ uint32_t follow_file(uint16_t cluster, uint32_t size, uint8_t *img_buf, struct b
     uint16_t last_fat_entry = 0;
     uint32_t chain_size = 0;
     int has_bad_sector = 0;
+    int has_free_sector = 0;
     //printf("before size: %d\n", size);
     
     //assert(cluster != 0);
     while (is_valid_cluster(cluster, bpb)){
-        last_fat_entry = cluster;
-
-        /* !!! mark this cluster referenced here !!! */
-        update_ref(cluster, ref);
+        /* !!! mark this cluster referenced here !!!
+            if overlap, change EOF */
+        if (update_ref(cluster, ref)){
+            printf("Chain overlap found, truncating FAT chain...\n");
+            set_fat_entry(last_fat_entry, FAT12_MASK&CLUST_EOFS, img_buf, bpb);
+            cluster = (CLUST_FREE & FAT12_MASK);
+            break;
+        }
 
         chain_size += CLUSTER_SIZE(bpb);
 
         if (size < CLUSTER_SIZE(bpb)){ //should be the last cluster according to dirent size
+            last_fat_entry = cluster;
             cluster = get_fat_entry(cluster, img_buf, bpb);
             has_bad_sector = (cluster == (CLUST_BAD & FAT12_MASK));
+            has_free_sector = (cluster == (CLUST_FREE & FAT12_MASK));
             break;
         }
         size -= CLUSTER_SIZE(bpb);
 
+        last_fat_entry = cluster;
         cluster = get_fat_entry(cluster, img_buf, bpb);
         has_bad_sector = (cluster == (CLUST_BAD & FAT12_MASK));
+        has_free_sector = (cluster == (CLUST_FREE & FAT12_MASK));
     }
 
     /* Fix any possible in-chain bad cluster */
     if (has_bad_sector){ 
-        printf("Bad sector found, truncating FAT chain...\n");
+        printf("Bad sector found in %s, truncating FAT chain...\n", path);
+        set_fat_entry(last_fat_entry, FAT12_MASK&CLUST_EOFS, img_buf, bpb);
+    }
+
+    /* Fix any possible in-chain free cluster */
+    if (has_free_sector){
+        printf("Free sector found in %s, truncating FAT chain...\n", path);
         set_fat_entry(last_fat_entry, FAT12_MASK&CLUST_EOFS, img_buf, bpb);
     }
 
@@ -372,8 +367,8 @@ uint16_t parse_dirent(struct direntry *dirent, uint8_t *img_buf, struct bpb33 *b
             subdir_cluster = getushort(dirent->deStartCluster);
 
             //delete entry if the starting cluster is bad
-            if (subdir_cluster == (CLUST_BAD & FAT12_MASK)){
-                printf("Deleting one entry because of bad cluster...\n");
+            if (subdir_cluster == (CLUST_BAD & FAT12_MASK) || ref[subdir_cluster] || subdir_cluster == (CLUST_FREE & FAT12_MASK)){
+                printf("Deleting %s because of bad starting cluster(or duplicate references or free cluster)...\n", path);
                 dirent->deName[0] = SLOT_DELETED;
                 return 0;
             }
@@ -387,8 +382,8 @@ uint16_t parse_dirent(struct direntry *dirent, uint8_t *img_buf, struct bpb33 *b
         uint16_t starting_cluster = getushort(dirent->deStartCluster);
 
         //delete entry if the starting cluster is bad
-        if (starting_cluster == (CLUST_BAD & FAT12_MASK)){
-            printf("Deleting one entry because of bad cluster...\n");
+        if (starting_cluster == (CLUST_BAD & FAT12_MASK) || ref[starting_cluster] || starting_cluster == (CLUST_FREE & FAT12_MASK)){
+            printf("Deleting %s entry because of bad starting cluster(or duplicate references or free cluster)...\n", path);
             dirent->deName[0] = SLOT_DELETED;
             return 0;
         }
@@ -408,12 +403,12 @@ uint16_t parse_dirent(struct direntry *dirent, uint8_t *img_buf, struct bpb33 *b
 void follow_dir(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb, char *ref, char *path){
     uint16_t last_fat_entry;
     int has_bad_sector = 0;
+    int has_free_sector = 0;
 
     char pathcopy[MAXPATHLEN];
     
 
     while (is_valid_cluster(cluster, bpb)){
-        last_fat_entry = cluster;
         /* !!! mark this cluster referenced here !!! */
         update_ref(cluster, ref);
 
@@ -429,13 +424,21 @@ void follow_dir(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb, char *ref
             }
             dirent++;
         }
+        last_fat_entry = cluster;
         cluster = get_fat_entry(cluster, img_buf, bpb);
         has_bad_sector = (cluster == (CLUST_BAD & FAT12_MASK));
+        has_free_sector = (cluster == (CLUST_FREE & FAT12_MASK));
     }
 
     /* Fix any possible in-chain bad cluster */
     if (has_bad_sector){ 
-        printf("Bad sector found, truncating FAT chain...\n");
+        printf("Bad sector found in %s, truncating FAT chain...\n", path);
+        set_fat_entry(last_fat_entry, FAT12_MASK&CLUST_EOFS, img_buf, bpb);
+    }
+
+    /* Fix any possible in-chain free cluster */
+    if (has_free_sector){ 
+        printf("Free sector found in %s, truncating FAT chain...\n", path);
         set_fat_entry(last_fat_entry, FAT12_MASK&CLUST_EOFS, img_buf, bpb);
     }
 }
@@ -467,22 +470,6 @@ void usage(char *progname) {
     exit(1);
 }
 
-/* debugging helpers */
-void print_ref(char *ref){
-    for (int i = 0; i < 2880; i++){
-        // if (ref[i] == 0)
-        //     printf("%c ", 'x');
-        // else if (i == 2879)
-        //     printf("2879\n");
-        // else
-        //     printf("%c ", 'p');
-        if (i == 2879)
-            printf("2879\n");
-    }
-}
-
-/* --------------------- */
-
 int main(int argc, char** argv) {
     uint8_t *img_buf;
     int fd;
@@ -500,29 +487,6 @@ int main(int argc, char** argv) {
     printf("\nStart checking for orphans...\n");
     traverse_ref(ref, img_buf, bpb);
     printf("Finished checking for orphans...\n");
-
-    // set_fat_entry(500, 600, img_buf, bpb);
-    // set_fat_entry(600, FAT12_MASK&CLUST_EOFS, img_buf, bpb);
-
-    // printf("cluster 500: %d\n", get_fat_entry(500, img_buf, bpb));
-    //printf("cluster 2800: %d\n", get_fat_entry(2800, img_buf, bpb));
-
-    // char buffer[5];
-    // memset(buffer, '\0', 4);
-    // sprintf(buffer, "%d", 12);
-    // printf("%s length is: %lu\n", buffer, strlen(buffer));
-
-    // char buffer[10];
-    // //memset(buffer, '1', 10);
-    // strcpy(buffer, "FOUND");
-    // printf("%s\n", buffer);
-
-    // memset(&buffer[5], '1', 5);
-    // for (int i = 0; i < 10; i++){
-    //     printf("%c ", buffer[i]);
-    // }
-
-    // printf("%d\n", is_valid_cluster(CLUST_BAD & FAT12_MASK, bpb));
 
     unmmap_file(img_buf, &fd);
     free(bpb);

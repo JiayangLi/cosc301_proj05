@@ -27,13 +27,18 @@ typedef struct {
     int orphan_size; //how many cluster currently in this orphan
 } orphan;
 
+typedef struct orphans_node{
+    orphan *one_orphan;
+    struct orphans_node *next;
+} orphans_node;
+
 void orphan_init(orphan *orp){
     orp->list_size = 5; //default size 5
     orp->orphan_size = 0;
     orp->cluster_p = (uint16_t *) malloc(sizeof(uint16_t) * orp->list_size);
 }
 
-void orphan_add(orphan *orp, uint16_t first, uint16_t second){
+int orphan_add(orphan *orp, uint16_t first, uint16_t second){
     if (orp->orphan_size == orp->list_size){ //need to resize
         orp->list_size = orp->list_size * 2;
         orp->cluster_p = (uint16_t *) realloc(orp->cluster_p, sizeof(uint16_t) * orp->list_size);
@@ -54,22 +59,75 @@ void orphan_add(orphan *orp, uint16_t first, uint16_t second){
         memcpy(&(orp->cluster_p[1]), chain, sizeof(uint16_t) * (orp->orphan_size));
         orp->orphan_size++;
         free(chain); 
-    } else { //should not happen
-        fprintf(stderr, "orphan_add is wrong!\n");
+    } else {
+        return 0;
     }
+    return 1;
 }
 
 void orphan_print(orphan *orp){
-    printf("printing one orphan:\n");
+    printf("printing an orphan chain: ");
     for (int i = 0; i < orp->orphan_size; i++){
         printf("%d ", orp->cluster_p[i]);
     }
-    printf("\nend of one orphan\n");
+    printf("\n");
 }
 
 void orphan_destroy(orphan *orp){
     free(orp->cluster_p);
     free(orp);
+}
+
+// void orphans_list_init(orphans_node *list){
+//     list->next = NULL;
+//     list->one_orphan = NULL;
+// }
+
+void orphans_list_add(orphans_node **list, uint16_t first, uint16_t second){
+    if (*list == NULL){ //first orphan encountered
+        orphan *add = (orphan *) malloc(sizeof(orphan));
+        orphan_init(add);
+        orphan_add(add, first, second);
+
+        orphans_node *new_orphan = (orphans_node *) malloc(sizeof(orphans_node));
+        new_orphan->one_orphan = add;
+        new_orphan->next = NULL;
+
+        *list = new_orphan;
+    } else { //need to iterate through the orphans list
+        orphans_node *temp = *list;
+        orphans_node *tail = temp;
+
+        for (; temp != NULL; temp = temp->next){
+            if (orphan_add(temp->one_orphan, first, second)){ //part of existing orphan
+                return;
+            }
+            if (temp->next == NULL){ //update tail
+                tail = temp;
+            }
+        }
+
+        //new orphan
+        orphan *add = (orphan *) malloc(sizeof(orphan));
+        orphan_init(add);
+        orphan_add(add, first, second);
+
+        orphans_node *new_orphan = (orphans_node *) malloc(sizeof(orphans_node));
+        new_orphan->one_orphan = add;
+        new_orphan->next = NULL;
+
+        tail->next = new_orphan;
+    }
+}
+
+void orphans_list_clear(orphans_node *list){
+    orphans_node *temp = list;
+    while (list != NULL){
+        orphan_destroy(list->one_orphan);
+        list = list->next;
+        free(temp);
+        temp = list;
+    }
 }
 /* --------end of orphan management helpers-------------- */
 
@@ -126,27 +184,27 @@ void update_ref(uint16_t cluster, char *ref){
     ref[cluster] = 1;
 }
 
-void follow_orphan(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb, char *ref, int orphan_id){
-    orphan *orp = (orphan *) malloc(sizeof(orphan));
-    orphan_init(orp);
+// void follow_orphan(uint16_t cluster, uint8_t *img_buf, struct bpb33 *bpb, char *ref, int orphan_id){
+//     orphan *orp = (orphan *) malloc(sizeof(orphan));
+//     orphan_init(orp);
 
-    uint16_t next_cluster;
+//     uint16_t next_cluster;
 
-    while (is_valid_cluster(cluster, bpb)){
-        //need to mark this entire orphan chain as "referenced"
-        //to ensure each orphan is visited once
-        update_ref(cluster, ref);  
+//     while (is_valid_cluster(cluster, bpb)){
+//         //need to mark this entire orphan chain as "referenced"
+//         //to ensure each orphan is visited once
+//         update_ref(cluster, ref);  
 
-        next_cluster = get_fat_entry(cluster, img_buf, bpb);
-        orphan_add(orp, cluster, next_cluster);
-        cluster = next_cluster;
-    }
-    orphan_print(orp);
-    /* Get the orphan home!!! - create a dirent for it in root dir*/
-    get_orphan_home(orp, img_buf, bpb, orphan_id);
+//         next_cluster = get_fat_entry(cluster, img_buf, bpb);
+//         orphan_add(orp, cluster, next_cluster);
+//         cluster = next_cluster;
+//     }
+//     orphan_print(orp);
+//     /* Get the orphan home!!! - create a dirent for it in root dir*/
+//     get_orphan_home(orp, img_buf, bpb, orphan_id);
 
-    orphan_destroy(orp);
-}
+//     orphan_destroy(orp);
+// }
 
 
 int is_chained(uint16_t cluster, struct bpb33 *bpb){
@@ -168,15 +226,28 @@ int is_chained(uint16_t cluster, struct bpb33 *bpb){
 void traverse_ref(char *ref, uint8_t *img_buf, struct bpb33 *bpb){
     uint16_t fat_value;
     int orphan_id = 1;
+    orphans_node *orphans_list = NULL;
+
     for(int i = 2; i < TOTAL_CLUSTERS(bpb); i++){
         if (ref[i] == 0){
             fat_value = get_fat_entry(i, img_buf, bpb);
             if (is_chained(fat_value, bpb)){
-                follow_orphan(i, img_buf, bpb, ref, orphan_id);
-                orphan_id++;
+                // printf("%d\n", i);
+                //follow_orphan(i, img_buf, bpb, ref, orphan_id);
+                // orphan_id++;
+                orphans_list_add(&orphans_list, i, fat_value);
             }
         }
     }
+    orphans_node *to_free = orphans_list;
+
+    for (; orphans_list != NULL; orphans_list = orphans_list->next){
+        orphan_print(orphans_list->one_orphan);
+        get_orphan_home(orphans_list->one_orphan, img_buf, bpb, orphan_id);
+        orphan_id++;
+    }
+    
+    orphans_list_clear(to_free);
 }
 
 /* Free all clusters starting from the given cluster*/
@@ -426,7 +497,7 @@ int main(int argc, char** argv) {
     // your code should start here...
     ref = traverse_root(img_buf, bpb);
 
-    printf("Start checking for orphans...\n");
+    printf("\nStart checking for orphans...\n");
     traverse_ref(ref, img_buf, bpb);
     printf("Finished checking for orphans...\n");
 
